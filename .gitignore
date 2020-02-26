@@ -21,6 +21,10 @@
 .idea/dictionaries
 .idea/vcs.xml
 .idea/jsLibraryMappings.xml
+.idea/flask-rest-api-sceleton.iml
+.idea/misc.xml
+.idea/modules.xml
+.idea/inspectionProfiles/
 
 # Sensitive or high-churn files:
 .idea/dataSources.ids
