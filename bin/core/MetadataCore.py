@@ -1,24 +1,26 @@
 import datetime
+import traceback
 
 from flask import request
 from flask_restful import Resource, abort
 from marshmallow_sqlalchemy.fields import fields
+from sqlalchemy import or_
 
-import bin.common.NotificationHandler as Log
 import bin.common.ResponseHandler as ResponseHandler
-from Config import EMPTY_DATE, DATE_FORMAT
-from bin.App import db, parser, ma
-from bin.common.Const import ERR
+from bin.Api import api_parameters
+from bin.App import db, ma
+from bin.common.Const import ERR, DATE_ISO_FORMAT, DATETIME_FORMAT_REGEX
 
 
-class BaseModel(db.Model):
+class ModelCore(db.Model):
     __abstract__ = True
     id = db.Column(db.Integer, primary_key=True)
     code = db.Column(db.String(150), index=True, unique=True)
     title = db.Column(db.String(250), index=True)
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
     is_deleted = db.Column(db.Boolean, default=False)
+    search_fields = ["code", "title"]
 
     def __repr__(self):
         return f"{self.title}"
@@ -33,20 +35,28 @@ class BaseModel(db.Model):
         data.pop("created_at", None)
         data.pop("updated_at", None)
         data.pop("is_deleted", None)
+        data.pop("_sa_instance_state", None)
 
         return data
 
 
-class BaseController:
+class ControllerCore:
 
     def __init__(self, **kwargs):
         self.model = kwargs.get("model")
         self.need_commit = kwargs.get("need_commit", True)
         self.throw_exception = kwargs.get("throw_exception", True)
 
-    def _error(self, message, log_write=Log.error):
-        log_write(message)
+    @staticmethod
+    def date_time_parser(dictionary: dict) -> dict:
 
+        result = {key: datetime.datetime.strptime(value, DATE_ISO_FORMAT)
+        if isinstance(value, str) and DATETIME_FORMAT_REGEX.match(value)
+        else value for key, value in dictionary.items()}
+
+        return result
+
+    def _error(self, message):
         if self.throw_exception:
             raise NotImplementedError(message)
 
@@ -59,7 +69,7 @@ class BaseController:
             item = db.session.query(self.model).filter(self.model.code == item_code).first()
 
             if item is not None:
-                self._error(f"Item with Code={item_code} already exists!", Log.error)
+                self._error(f"Item with Code={item_code} already exists!")
 
                 return item
 
@@ -68,9 +78,13 @@ class BaseController:
         db.session.add(item)
 
         if self.need_commit:
-            db.session.commit()
+            try:
+                db.session.commit()
 
-        Log.ok(f"Item '{item}' was created")
+            except Exception as ex:
+                db.session.rollback()
+                item = None
+                self._error(f"{ex}")
 
         return item
 
@@ -83,13 +97,13 @@ class BaseController:
             item = db.session.query(self.model).get(item_id)
 
             if item is None:
-                self._error(f"Item with ID={item_id} not found!", Log.warning)
+                self._error(f"Item with ID={item_id} not found!")
 
         elif item_code is not None:
             item = db.session.query(self.model).filter(self.model.code == item_code).first()
 
             if item is None:
-                self._error(f"Item with Code={item_code} not found!", Log.warning)
+                self._error(f"Item with Code={item_code} not found!")
 
         return item
 
@@ -98,21 +112,25 @@ class BaseController:
         item_id = kwargs.get("id")
 
         if item_id is None:
-            self._error(f"No id specified!", Log.error)
+            self._error(f"No id specified!")
 
         item = db.session.query(self.model).get(item_id)
 
         if item is None:
-            self._error(f"Item not found!", Log.error)
+            self._error(f"Item not found!")
 
         data = self.model.delete_not_updated_fields(**kwargs)
         db.session.query(self.model).filter(self.model.id == item_id).update(data)
         item = self.read(**kwargs)
 
         if self.need_commit:
-            db.session.commit()
+            try:
+                db.session.commit()
 
-        Log.ok(f"Item {item} was updated")
+            except Exception as ex:
+                db.session.rollback()
+                item = None
+                self._error(f"{ex}")
 
         return item
 
@@ -121,18 +139,22 @@ class BaseController:
         item = self.read(**kwargs)
 
         if not item:
-            self._error(f"Item not found!", Log.error)
+            self._error(f"Item not found!")
 
         if item.is_deleted:
             db.session.delete(item)
 
         else:
-            self._error(f"Item '{item}' cannot be deleted", Log.error)
+            self._error(f"Item '{item}' cannot be deleted")
 
         if self.need_commit:
-            db.session.commit()
+            try:
+                db.session.commit()
 
-        Log.ok(f"Item '{item} ' was deleted")
+            except Exception as ex:
+                db.session.rollback()
+                item = None
+                self._error(f"{ex}")
 
         return True
 
@@ -149,21 +171,25 @@ class BaseController:
             item = db.session.query(self.model).filter(self.model.code == item_code).first()
 
         if not item:
-            self._error(f"Item not found!", Log.error)
+            self._error(f"Item not found!")
 
             return item
 
         if item.is_deleted:
-            self._error(f"Item '{item}' cannot be mark to delete", Log.error)
+            self._error(f"Item '{item}' cannot be mark to delete")
 
         else:
             item.is_deleted = True
             db.session.add(item)
 
             if self.need_commit:
-                db.session.commit()
+                try:
+                    db.session.commit()
 
-        Log.ok(f"Item '{item} ' was marked to delete")
+                except Exception as ex:
+                    db.session.rollback()
+                    item = None
+                    self._error(f"{ex}")
 
         return item
 
@@ -179,12 +205,12 @@ class BaseController:
             item = db.session.query(self.model).filter(self.model.code == item_code).first()
 
         if not item:
-            self._error(f"Item not found!", Log.error)
+            self._error(f"Item not found!")
 
             return item
 
         if not item.is_deleted:
-            self._error(f"Item '{item}' cannot be mark to undelete", Log.error)
+            self._error(f"Item '{item}' cannot be mark to undelete")
 
             return item
 
@@ -193,38 +219,41 @@ class BaseController:
             db.session.add(item)
 
         if self.need_commit:
-            db.session.commit()
+            try:
+                db.session.commit()
 
-        Log.ok(f"Item '{item} ' was marked to undelete")
+            except Exception as ex:
+                db.session.rollback()
+                item = None
+                self._error(f"{ex}")
 
         return item
 
-    def to_dict(self, **kwargs):
-        item = self.read(**kwargs)
-        result = item.__dict__.copy()
-        _created_at = EMPTY_DATE if item.created_at is None else item.created_at
-        _updated_at = EMPTY_DATE if item.updated_at is None else item.updated_at
-        _code = "No_name" if item.code is None else item.code
+    def get_list(self, **kwargs):
+        limit = kwargs.get("limit")
+        page = kwargs.get("page")
+        owner_id = kwargs.get("owner_id")
+        query_string = kwargs.get("query_string")
+        items = self.model.query.order_by(db.desc(self.model.created_at))
 
-        result["created_at"] = _created_at.strftime(DATE_FORMAT)
-        result["updated_at"] = _created_at.strftime(DATE_FORMAT)
-        result["code"] = _code
+        if owner_id:
+            items = items.filter(self.model.owner_id == owner_id)
 
-        return result
-
-    def get_list(self, limit: int = None, page: int = None):
-        query = self.model.query.order_by(self.model.created_at)
+        if query_string:
+            query_string = f"%{query_string}%"
+            filter_list = [getattr(self.model, field).like(query_string) for field in self.model.search_fields]
+            items = items.filter(or_(*filter_list))
 
         if limit:
-            items = query.paginate(page, limit, False)
+            items = items.paginate(page, limit, False)
 
         else:
-            items = query.all()
+            items = items.all()
 
         return items
 
 
-class BaseRouter:
+class RouterCore:
     endpoint = None
     controller = None
     schema = None
@@ -262,9 +291,9 @@ class BaseRouter:
 
             except Exception as ex:
 
-                return ResponseHandler.render_response(status=ERR, message=str(ex))
+                return ResponseHandler.render_response(status=ERR, message=traceback.format_exc())
 
-        def patch(self, item_id: int):
+        def patch(self, item_id):
             """Update an item by ID"""
 
             try:
@@ -274,8 +303,9 @@ class BaseRouter:
                 if data is None:
                     raise NotImplementedError("No data")
 
-                data["id"] = item_id
                 controller = self.controller()
+                data["id"] = item_id
+                data = controller.date_time_parser(data)
                 schema = self.schema(many=False)
                 raw_data = controller.update(**data)
                 data = schema.dump(raw_data)
@@ -284,7 +314,7 @@ class BaseRouter:
 
             except Exception as ex:
 
-                return ResponseHandler.render_response(status=ERR, message=str(ex))
+                return ResponseHandler.render_response(status=ERR, message=traceback.format_exc())
 
         def delete(self, item_id: int):
 
@@ -300,7 +330,7 @@ class BaseRouter:
 
             except Exception as ex:
 
-                return ResponseHandler.render_response(status=ERR, message=str(ex))
+                return ResponseHandler.render_response(status=ERR, message=traceback.format_exc())
 
     class Items(Resource):
         """Routes by template '/item/' """
@@ -315,16 +345,15 @@ class BaseRouter:
             self.schema = kwargs.get("schema")
             self.controller = kwargs.get("controller")
 
-        def get(self, limit: int = None, page: int = None):
+        def get(self):
             """Reads a list of items"""
 
             try:
-                args = parser.parse_args()
+                args = api_parameters.parse_args()
                 limit = args.get("limit")
-                page = args.get("page")
                 controller = self.controller()
                 schema = self.schema(many=True)
-                raw_data = controller.get_list(limit, page)
+                raw_data = controller.get_list(**args)
 
                 if limit:
                     items = raw_data.items
@@ -338,15 +367,15 @@ class BaseRouter:
 
             except Exception as ex:
 
-                return ResponseHandler.render_response(status=ERR, message=str(ex))
+                return ResponseHandler.render_response(status=ERR, message=traceback.format_exc())
 
         def post(self):
             """Adds a new item"""
 
             try:
 
-                kwargs = request.json
                 controller = self.controller()
+                kwargs = controller.date_time_parser(request.json)
                 schema = self.schema(many=False)
                 raw_data = controller.create(**kwargs)
                 data = schema.dump(raw_data)
@@ -355,7 +384,45 @@ class BaseRouter:
 
             except Exception as ex:
 
-                return ResponseHandler.render_response(status=ERR, message=str(ex))
+                return ResponseHandler.render_response(status=ERR, message=traceback.format_exc())
+
+    class ItemsFromOwner(Resource):
+        """Routes by template '/item/from/<int:owner_id>' """
+
+        @staticmethod
+        def route(endpoint: str):
+            route = f"/{endpoint}/from/<int:owner_id>"
+
+            return route
+
+        def __init__(self, **kwargs):
+            self.schema = kwargs.get("schema")
+            self.controller = kwargs.get("controller")
+
+        def get(self, owner_id: int):
+
+            try:
+
+                args = api_parameters.parse_args()
+                limit = args.get("limit")
+                page = args.get("page")
+                controller = self.controller()
+                schema = self.schema(many=True)
+                raw_data = controller.get_list(owner_id=owner_id, limit=limit, page=page)
+
+                if limit:
+                    items = raw_data.items
+                    items = schema.dump(items)
+                    data = ResponseHandler.get_section_paginate(raw_data, items)
+
+                else:
+                    data = schema.dump(raw_data)
+
+                return ResponseHandler.render_response(data=data)
+
+            except Exception as ex:
+
+                return ResponseHandler.render_response(status=ERR, message=traceback.format_exc())
 
     class ItemsActions(Resource):
         """Routes by template '/item/<int:item_id>/<string:action>' """
@@ -396,12 +463,16 @@ class BaseRouter:
 
             except Exception as ex:
 
-                return ResponseHandler.render_response(status=ERR, message=str(ex))
+                return ResponseHandler.render_response(status=ERR, message=traceback.format_exc())
 
 
-class BaseSchema(ma.ModelSchema):
+class SchemaCore(ma.ModelSchema):
     date_time_format = "%d.%m.%Y %H:%M:%S%z"
     created_at = fields.DateTime(format=date_time_format)
     updated_at = fields.DateTime(format=date_time_format)
     start_at = fields.DateTime(format=date_time_format)
     end_at = fields.DateTime(format=date_time_format)
+    start_date = fields.DateTime(format=date_time_format)
+    end_date = fields.DateTime(format=date_time_format)
+    last_run = fields.DateTime(format=date_time_format)
+    next_run = fields.DateTime(format=date_time_format)
